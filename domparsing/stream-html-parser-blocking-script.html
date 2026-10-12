@@ -516,4 +516,48 @@
     await new Promise(r => t.step_timeout(r, 350));
     assert_false(window.iframe_blocked_ran, "Scripts in removed iframe must not execute");
   }, "Removing iframe while stream is blocked on external script does not crash or execute scripts");
+
+  // The write and close promises do not wait for a pending parser-blocking
+  // script. Once close() has settled the stream can no longer be aborted, so
+  // the pending script and the markup buffered after it are still processed.
+  for (const method of ["streamHTMLUnsafe", "streamAppendHTMLUnsafe", "streamPrependHTMLUnsafe"]) {
+    promise_test(async (t) => {
+      window.events = [];
+      const slowRan = new Promise((resolve) => { window.on_slow = resolve; });
+      t.add_cleanup(() => { delete window.on_slow; });
+      const placeholder = document.getElementById("placeholder");
+      placeholder.replaceChildren();
+      const writer = placeholder[method]({ runScripts: true }).getWriter();
+
+      await writer.write(
+        "<p id='before-blocking'>before</p>" +
+        "<script src='resources/slow.js?pipe=trickle(d0.5)&close=1'></" + "script>" +
+        "<p id='after-blocking'>after</p>"
+      );
+      assert_array_equals(window.events, [], "the write promise does not wait for the parser-blocking script");
+      assert_not_equals(placeholder.querySelector("#before-blocking"), null);
+      assert_equals(placeholder.querySelector("#after-blocking"), null, "parsing is blocked on the script");
+
+      await writer.write("<p id='second-chunk'>second</p>");
+      assert_array_equals(window.events, [], "a subsequent write promise does not wait for the parser-blocking script either");
+      assert_equals(placeholder.querySelector("#second-chunk"), null);
+
+      await writer.close();
+      assert_array_equals(window.events, [], "the close promise does not wait for the parser-blocking script");
+      assert_equals(placeholder.querySelector("#after-blocking"), null);
+
+      // The stream is closed: abort() is a no-op and write() rejects.
+      await writer.abort("too late");
+      await promise_rejects_js(t, TypeError, writer.write("<p id='after-close'>x</p>"));
+
+      await slowRan;
+      assert_array_equals(window.events, ["slow"], "the pending parser-blocking script still runs after close()");
+      // The parser resumes in a task after the script executes.
+      while (!placeholder.querySelector("#second-chunk")) {
+        await new Promise((r) => t.step_timeout(r, 10));
+      }
+      assert_not_equals(placeholder.querySelector("#after-blocking"), null, "markup after the blocking script is inserted once it ran");
+      assert_equals(placeholder.querySelector("#after-close"), null);
+    }, `${method}: close() does not wait for a pending parser-blocking script, which still runs afterwards`);
+  }
 </script>
